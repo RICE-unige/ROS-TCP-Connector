@@ -133,6 +133,49 @@ namespace Unity.Robotics.ROSTCPConnector
 
         Dictionary<string, RosTopicState> m_Topics = new Dictionary<string, RosTopicState>();
 
+        // OPTIONAL declarative outbound lane/QoS overrides, keyed by topic. Populated by
+        // SetSubscribePolicy and consulted when a subscriber registration is sent. Empty by
+        // default, so topics without an entry use the existing (heuristic) bridge classification.
+        Dictionary<string, string> m_SubscribePolicies = new Dictionary<string, string>();
+
+        // Declare an explicit outbound transport lane/QoS policy for a topic's bridge subscription.
+        // Valid values: "strict", "replaceable", "bulk_strict", "bulk_replaceable". Pass null or
+        // empty to clear a previously declared policy (reverting to the bridge's heuristic lane).
+        // Must be called before the topic is subscribed for the policy to be included in the
+        // initial __subscribe; calling it later affects subsequent (re)registrations.
+        public void SetSubscribePolicy(string topic, string policy)
+        {
+            if (string.IsNullOrEmpty(topic))
+            {
+                return;
+            }
+
+            lock (m_SubscribePolicies)
+            {
+                if (string.IsNullOrWhiteSpace(policy))
+                {
+                    m_SubscribePolicies.Remove(topic);
+                }
+                else
+                {
+                    m_SubscribePolicies[topic] = policy.Trim().ToLowerInvariant();
+                }
+            }
+        }
+
+        string GetSubscribePolicy(string topic)
+        {
+            if (string.IsNullOrEmpty(topic))
+            {
+                return null;
+            }
+
+            lock (m_SubscribePolicies)
+            {
+                return m_SubscribePolicies.TryGetValue(topic, out string policy) ? policy : null;
+            }
+        }
+
         public void ListenForTopics(Action<RosTopicState> callback, bool notifyAllExistingTopics = false)
         {
             m_NewTopicCallbacks.Add(callback);
@@ -200,6 +243,21 @@ namespace Unity.Robotics.ROSTCPConnector
             });
         }
 
+        public void SubscribeRaw(string topic, string rosMessageName, Action<byte[]> callback, string policy = null)
+        {
+            if (string.IsNullOrEmpty(topic) || string.IsNullOrEmpty(rosMessageName) || callback == null)
+            {
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(policy))
+            {
+                SetSubscribePolicy(topic, policy);
+            }
+
+            AddRawSubscriberInternal(topic, rosMessageName, callback);
+        }
+
         public void Unsubscribe(string topic)
         {
             RosTopicState info = GetTopic(topic);
@@ -229,6 +287,27 @@ namespace Unity.Robotics.ROSTCPConnector
             }
 
             info.AddSubscriber(callback);
+
+            foreach (Action<RosTopicState> topicCallback in m_NewTopicCallbacks)
+            {
+                topicCallback(info);
+            }
+        }
+
+        void AddRawSubscriberInternal(string topic, string rosMessageName, Action<byte[]> callback)
+        {
+            if (callback == null)
+            {
+                return;
+            }
+
+            RosTopicState info;
+            if (!m_Topics.TryGetValue(topic, out info))
+            {
+                info = AddTopic(topic, rosMessageName);
+            }
+
+            info.AddRawSubscriber(callback);
 
             foreach (Action<RosTopicState> topicCallback in m_NewTopicCallbacks)
             {
@@ -380,7 +459,21 @@ namespace Unity.Robotics.ROSTCPConnector
 
             public void SendSubscriberRegistration(string topic, string rosMessageName, NetworkStream stream = null)
             {
-                m_Self.SendSysCommand(SysCommand.k_SysCommand_Subscribe, new SysCommand_TopicAndType { topic = topic, message_name = rosMessageName }, stream);
+                // If a declarative transport lane was registered for this topic, forward it as the
+                // "policy" key so the bridge honors it verbatim; otherwise send the unchanged plain
+                // registration and let the bridge classify the lane heuristically (default behavior).
+                string policy = m_Self.GetSubscribePolicy(topic);
+                if (!string.IsNullOrEmpty(policy))
+                {
+                    m_Self.SendSysCommand(
+                        SysCommand.k_SysCommand_Subscribe,
+                        new SysCommand_SubscribeWithPolicy { topic = topic, message_name = rosMessageName, policy = policy },
+                        stream);
+                }
+                else
+                {
+                    m_Self.SendSysCommand(SysCommand.k_SysCommand_Subscribe, new SysCommand_TopicAndType { topic = topic, message_name = rosMessageName }, stream);
+                }
             }
 
             public void SendRosServiceRegistration(string topic, string rosMessageName, NetworkStream stream = null)
@@ -568,9 +661,98 @@ namespace Unity.Robotics.ROSTCPConnector
 
         Action<string, byte[]> m_SpecialIncomingMessageHandler;
 
+        // ---------------------------------------------------------------------
+        // HORUS additive optimization: Realtime-first, time-budgeted ingestion.
+        //
+        // The stock pump (below, the original code path) drains the entire
+        // incoming queue and deserializes every message synchronously inside a
+        // single Update(). A burst of large "bulk/map" messages (PointCloud2,
+        // mesh markers, gaussian-splat chunks, occupancy grids, registry
+        // replays, ...) can therefore stall the main thread and delay
+        // latency-sensitive "realtime" traffic (camera, TF, laser scan, odom).
+        //
+        // When EnableRealtimeFirstPump is true, Update() instead:
+        //   (a) drains the queue ONCE into a local buffer (FIFO order preserved),
+        //   (b) processes realtime / syscommand / service-handshake messages
+        //       immediately, in order,
+        //   (c) processes remaining bulk messages under a bounded per-frame time
+        //       budget, carrying any remainder to the next Update() with their
+        //       relative order intact.
+        //
+        // This is LOSSLESS: no message is dropped, no payload is altered, and
+        // per-topic message order is preserved (a topic is classified as either
+        // realtime or bulk, never split across both lanes).
+        //
+        // SAFETY / DEFAULT-OFF: the flag defaults to false, so the shipped
+        // behavior is byte-for-byte the original loop. Turn it on from Unity via
+        // ROSConnection.EnableRealtimeFirstPump = true after populating
+        // RealtimeTopics / RealtimeTopicPredicate. Service request/response
+        // routing relies on m_SpecialIncomingMessageHandler consuming the *next*
+        // message in strict order; to never corrupt that, the budgeted path
+        // falls back to strict in-order draining whenever a special handler is
+        // pending or a syscommand that arms one is encountered.
+        // ---------------------------------------------------------------------
+
+        /// <summary>
+        /// Opt-in: when true, Update() prioritizes realtime topics and time-slices
+        /// bulk/map deserialization. Defaults to false (original behavior).
+        /// </summary>
+        public static bool EnableRealtimeFirstPump = false;
+
+        /// <summary>
+        /// Per-frame wall-clock budget (milliseconds) for deserializing bulk
+        /// (non-realtime) messages once the realtime lane has been drained.
+        /// Realtime and syscommand traffic is always fully drained and is not
+        /// charged against this budget. Only consulted when
+        /// <see cref="EnableRealtimeFirstPump"/> is true.
+        /// </summary>
+        public static float BulkProcessingBudgetMs = 4.0f;
+
+        /// <summary>
+        /// Exact-match set of topic names treated as realtime (drained first,
+        /// never deferred). Populate from Unity (e.g. "/tf", camera, scan, odom).
+        /// Empty by default.
+        /// </summary>
+        public static readonly HashSet<string> RealtimeTopics = new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Optional additional predicate for classifying a topic as realtime,
+        /// used when an exact-match in <see cref="RealtimeTopics"/> is not found
+        /// (e.g. prefix rules). Null by default.
+        /// </summary>
+        public static Func<string, bool> RealtimeTopicPredicate = null;
+
+        static bool IsRealtimeTopic(string topic)
+        {
+            if (RealtimeTopics.Count > 0 && RealtimeTopics.Contains(topic))
+                return true;
+            Func<string, bool> predicate = RealtimeTopicPredicate;
+            if (predicate != null)
+            {
+                try
+                {
+                    return predicate(topic);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogException(e);
+                }
+            }
+            return false;
+        }
+
+        // Reused scratch buffer for the bulk remainder carried between frames.
+        readonly List<Tuple<string, byte[]>> m_BulkCarryover = new List<Tuple<string, byte[]>>();
+
         void Update()
         {
             s_RealTimeSinceStartup = Time.realtimeSinceStartup;
+
+            if (EnableRealtimeFirstPump)
+            {
+                UpdateRealtimeFirst();
+                return;
+            }
 
             Tuple<string, byte[]> data;
             while (m_IncomingMessages.TryDequeue(out data))
@@ -606,6 +788,120 @@ namespace Unity.Robotics.ROSTCPConnector
 
                     }
                 }
+            }
+        }
+
+        // Dispatches a single already-dequeued message exactly as the stock loop
+        // would. Kept identical in behavior so realtime/bulk lanes share one
+        // code path and cannot diverge in handling.
+        void DispatchIncoming(string topic, byte[] contents)
+        {
+            m_LastMessageReceivedRealtime = Time.realtimeSinceStartup;
+
+            if (m_SpecialIncomingMessageHandler != null)
+            {
+                m_SpecialIncomingMessageHandler(topic, contents);
+            }
+            else if (topic.StartsWith("__"))
+            {
+                ReceiveSysCommand(topic, Encoding.UTF8.GetString(contents));
+            }
+            else
+            {
+                RosTopicState topicInfo = GetTopic(topic);
+                if (topicInfo != null)
+                {
+                    try
+                    {
+                        topicInfo.OnMessageReceived(contents);
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.LogException(e);
+                    }
+                }
+            }
+        }
+
+        void UpdateRealtimeFirst()
+        {
+            // Carry-over bulk messages from previous frame(s) are already present
+            // in m_BulkCarryover (FIFO) and are processed first in pass 2 so a
+            // steady bulk stream cannot be starved.
+            float budgetSeconds = Mathf.Max(0f, BulkProcessingBudgetMs) * 0.001f;
+            float frameStart = Time.realtimeSinceStartup;
+
+            // Snapshot this frame's freshly-arrived messages once, in order.
+            // Realtime + syscommand + special-handler messages are dispatched
+            // immediately; bulk data messages are appended to the carryover for
+            // budgeted processing. If a special handler is pending or armed, we
+            // MUST process strictly in order, so everything is dispatched inline.
+            Tuple<string, byte[]> data;
+            while (m_IncomingMessages.TryDequeue(out data))
+            {
+                string topic = data.Item1;
+
+                bool mustStayInOrder = m_SpecialIncomingMessageHandler != null || topic.StartsWith("__");
+                if (mustStayInOrder)
+                {
+                    // Service handshake / response routing and syscommands are
+                    // strictly order-sensitive: dispatch immediately. Any bulk
+                    // messages already buffered for this frame remain queued in
+                    // m_BulkCarryover and keep their earlier-arrival ordering.
+                    DispatchIncoming(data.Item1, data.Item2);
+                }
+                else if (IsRealtimeTopic(topic))
+                {
+                    DispatchIncoming(data.Item1, data.Item2);
+                }
+                else
+                {
+                    m_BulkCarryover.Add(data);
+                }
+            }
+
+            // A syscommand can arm m_SpecialIncomingMessageHandler while its
+            // paired payload has not arrived yet. Do not let older deferred
+            // bulk data become the "next" special-handler payload; wait for
+            // the actual next incoming message to satisfy the handler first.
+            if (m_SpecialIncomingMessageHandler != null)
+            {
+                return;
+            }
+
+            // Pass 2: drain bulk messages under the per-frame time budget,
+            // preserving order. Whatever does not fit stays in m_BulkCarryover
+            // for the next Update(). A budget <= 0 still guarantees forward
+            // progress by processing at least one bulk message per frame.
+            int processed = 0;
+            while (processed < m_BulkCarryover.Count)
+            {
+                Tuple<string, byte[]> bulk = m_BulkCarryover[processed];
+
+                // If a service handshake arrives interleaved (its syscommand was
+                // handled above and armed m_SpecialIncomingMessageHandler), the
+                // next raw message must go to that handler, not here. Bulk data
+                // never arms a handler, so this only guards against a handler
+                // left pending across frames; dispatch in order to be safe.
+                DispatchIncoming(bulk.Item1, bulk.Item2);
+                processed++;
+
+                if (budgetSeconds > 0f && Time.realtimeSinceStartup - frameStart >= budgetSeconds)
+                {
+                    // Budget spent; remaining bulk messages stay in
+                    // m_BulkCarryover and are drained on subsequent frames.
+                    break;
+                }
+            }
+
+            // Compact the carryover: drop the processed prefix, keep the rest in
+            // order for next frame.
+            if (processed > 0)
+            {
+                if (processed >= m_BulkCarryover.Count)
+                    m_BulkCarryover.Clear();
+                else
+                    m_BulkCarryover.RemoveRange(0, processed);
             }
         }
 

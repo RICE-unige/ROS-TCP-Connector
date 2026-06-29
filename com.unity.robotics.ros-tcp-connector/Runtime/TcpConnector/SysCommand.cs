@@ -68,6 +68,19 @@ namespace Unity.Robotics.ROSTCPConnector
         public string message_name;
     }
 
+    // Variant of the subscribe registration that additionally declares an explicit outbound
+    // lane/QoS policy for the bridge to honor (values: strict | replaceable | bulk_strict |
+    // bulk_replaceable). Only emitted when a policy has been registered for the topic via
+    // ROSConnection.SetSubscribePolicy; otherwise the plain SysCommand_TopicAndType is sent and
+    // the bridge falls back to its heuristic lane classifier. Backward-compatible: an absent
+    // "policy" key is the existing default behavior.
+    public struct SysCommand_SubscribeWithPolicy
+    {
+        public string topic;
+        public string message_name;
+        public string policy;
+    }
+
     // For backwards compatibility, we encode the handshake in two stages:
     // Stage 1 - which must NEVER change - is just a version string and a metadata string.
     public struct SysCommand_Handshake

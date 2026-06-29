@@ -42,7 +42,8 @@ namespace Unity.Robotics.ROSTCPConnector
         public bool IsService => m_ServiceResponseTopic != null || m_Subtopic == MessageSubtopic.Response;
 
         List<Action<Message>> m_SubscriberCallbacks = new List<Action<Message>>();
-        public bool HasSubscriberCallback => m_SubscriberCallbacks.Count > 0;
+        List<Action<byte[]>> m_RawSubscriberCallbacks = new List<Action<byte[]>>();
+        public bool HasSubscriberCallback => m_SubscriberCallbacks.Count > 0 || m_RawSubscriberCallbacks.Count > 0;
         public bool SentSubscriberRegistration { get; private set; }
 
         float m_LastMessageReceivedRealtime;
@@ -83,7 +84,12 @@ namespace Unity.Robotics.ROSTCPConnector
                 return;
             }
 
-            // don't bother deserializing this message if nobody cares
+            if (m_RawSubscriberCallbacks.Count > 0)
+            {
+                m_RawSubscriberCallbacks.ForEach(item => item(data));
+            }
+
+            // don't bother deserializing this message if nobody cares about the typed form
             if (m_SubscriberCallbacks.Count == 0)
             {
                 return;
@@ -154,6 +160,13 @@ namespace Unity.Robotics.ROSTCPConnector
             RegisterSubscriber();
         }
 
+        public void AddRawSubscriber(Action<byte[]> callback)
+        {
+            m_RawSubscriberCallbacks.Add(callback);
+
+            RegisterSubscriber();
+        }
+
         void RegisterSubscriber(NetworkStream stream = null)
         {
             if (m_Connection.HasConnectionThread && !SentSubscriberRegistration && !IsService)
@@ -166,6 +179,7 @@ namespace Unity.Robotics.ROSTCPConnector
         public void UnsubscribeAll()
         {
             m_SubscriberCallbacks.Clear();
+            m_RawSubscriberCallbacks.Clear();
             m_ConnectionInternal.SendSubscriberUnregistration(m_Topic);
             SentSubscriberRegistration = false;
         }
@@ -243,7 +257,7 @@ namespace Unity.Robotics.ROSTCPConnector
 
         internal void OnConnectionEstablished(NetworkStream stream)
         {
-            if (m_SubscriberCallbacks.Count > 0 && !SentSubscriberRegistration)
+            if ((m_SubscriberCallbacks.Count > 0 || m_RawSubscriberCallbacks.Count > 0) && !SentSubscriberRegistration)
             {
                 m_ConnectionInternal.SendSubscriberRegistration(m_Topic, m_RosMessageName, stream);
                 SentSubscriberRegistration = true;
